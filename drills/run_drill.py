@@ -13,7 +13,9 @@ Scenarios:
   timeout   等待时限过短：摘链超时，不迁流，缓冲包仍走原链路 A；迟到的确认
             不会改变结果。
   buffer    缓冲上限为 1：第二个待迁包被拒收，其他流照发。
-  reject2   第二个摘链申请在上一个未完成时被拒（一次只处理一个）。
+  deadline  到期后（确认尚未收齐）给待迁流发新包：先按接纳顺序把缓冲包排回
+            原链路，新包接着入队并返回 201；迟到的确认只记入摘链记录。
+  after_removal  摘链成功后成员链路出组，reset 才能复原。
 """
 
 from __future__ import annotations
@@ -198,8 +200,56 @@ SCENARIOS = {
 }
 
 
+def scenario_deadline(base: str) -> None:
+    print("\n== 场景 4：到期后先回排缓冲包，新包入队返回 201 ==")
+    # Slow member link so the snapshot ack lands well after the deadline.
+    call(base, "PATCH", "/api/links/A", {"delivery_delay_ms": 600, "ack_delay_ms": 400}, expect=200)
+    call(base, "POST", "/api/flows", {"flow_id": "edge", "link": "A"}, expect=201)
+    call(base, "POST", "/api/flows/edge/packets", {"seq": 1}, expect=201)
+
+    _, rm = call(
+        base, "POST", "/api/removals",
+        {"member_link": "A", "wait_ms": 150, "buffer_limit": 2}, expect=202,
+    )
+    call(base, "POST", "/api/flows/edge/packets", {"seq": 2}, expect=202)
+    call(base, "POST", "/api/flows/edge/packets", {"seq": 3}, expect=202)
+    _, rejected = call(base, "POST", "/api/flows/edge/packets", {"seq": 4}, expect=429)
+    check("等待期间缓冲满仍返回 429", rejected.get("buffered_count") == 2)
+
+    time.sleep(0.3)  # past the 150ms deadline; confirmation still in flight
+    _, sent = call(base, "POST", "/api/flows/edge/packets", {"seq": 4}, expect=201)
+    check("到期后发包返回 201 而非 429", sent["buffered"] is False)
+    check("新包直接排在原链路 A", sent["packet"]["link"] == "A")
+
+    _, detail = call(base, "GET", f"/api/removals/{rm['removal_id']}", expect=200)
+    check("到期判超时", detail["status"] == "timed_out")
+    check("超时不迁流", detail["moved_flow_ids"] == [])
+    check(
+        "缓冲包按接纳顺序回排原链路",
+        detail["flushed_to"] == "A" and len(detail["flushed_packet_ids"]) == 2,
+    )
+
+    order = wait_until(lambda: (lambda o: o if len(o) == 4 else None)(received(base, "edge")), timeout=15)
+    check("四个已接纳包全部送达", order is not None)
+    if order:
+        check("按接纳顺序 1,2,3,4 送达", [x["seq"] for x in order] == [1, 2, 3, 4])
+        check("全部走原链路 A", [x["link"] for x in order] == ["A", "A", "A", "A"])
+        check("每包只送达一次", len({x["packet_id"] for x in order}) == 4)
+
+    _, detail = call(base, "GET", f"/api/removals/{rm['removal_id']}", expect=200)
+    check(
+        "迟到确认只记入摘链记录",
+        detail["status"] == "timed_out" and detail["late_confirmations_ignored"] >= 1,
+    )
+    _, flow = call(base, "GET", "/api/flows/edge", expect=200)
+    check("edge 仍承载在 A", flow["link"] == "A")
+
+
+SCENARIOS["deadline"] = scenario_deadline
+
+
 def scenario_after_removal(base: str) -> None:
-    print("\n== 场景 4：摘链后成员链路已出组（reset 才能复原）==")
+    print("\n== 场景 5：摘链后成员链路已出组（reset 才能复原）==")
     call(base, "POST", "/api/flows", {"flow_id": "last", "link": "A"}, expect=201)
     _, rm = call(
         base, "POST", "/api/removals",

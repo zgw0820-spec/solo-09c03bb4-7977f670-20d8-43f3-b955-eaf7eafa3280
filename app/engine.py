@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 LINK_IDS = ("A", "B")
 
 
+def iso_utc(moment: datetime) -> str:
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def utcnow() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
+    return iso_utc(datetime.now(timezone.utc))
 
 
 class DrillError(Exception):
@@ -83,6 +84,7 @@ class Packet:
     payload: Any
     accepted_at: str
     accept_index: int
+    accept_order: int = 0
     status: str = "queued"  # queued | delivering | delivered | acked | buffered
     link: str | None = None
     delivered_at: str | None = None
@@ -98,6 +100,7 @@ class Packet:
             "status": self.status,
             "link": self.link,
             "accepted_at": self.accepted_at,
+            "accept_order": self.accept_order,
             "delivered_at": self.delivered_at,
             "acked_at": self.acked_at,
             "flow_delivery_index": self.flow_delivery_index,
@@ -118,6 +121,9 @@ class RemovalRequest:
     finished_at: str | None = None
     result: str | None = None
     reason: str | None = None
+    # Wall-clock deadline for display; all decisions use deadline_monotonic.
+    deadline_at: str | None = None
+    deadline_monotonic: float = field(default=0.0, repr=False)
     affected_flow_ids: list[str] = field(default_factory=list)
     snapshot_packet_ids: list[str] = field(default_factory=list)
     snapshot_acked: int = 0
@@ -147,6 +153,7 @@ class RemovalRequest:
             "buffer_limit": self.buffer_limit,
             "buffer_used": len(self.buffered_packet_ids),
             "created_at": self.created_at,
+            "deadline_at": self.deadline_at,
             "finished_at": self.finished_at,
             "affected_flow_ids": self.affected_flow_ids,
             "moved_flow_ids": self.moved_flow_ids,
@@ -198,6 +205,7 @@ class DrillEngine:
         self._removal_order: list[str] = []
         self.active_removal_id: str | None = None
         self._packets: dict[str, Packet] = {}
+        self._accept_counter = 0
         self.events: list[dict] = []
         self._reset_state()
 
@@ -211,6 +219,7 @@ class DrillEngine:
         self._removal_order = []
         self.active_removal_id = None
         self._packets = {}
+        self._accept_counter = 0
         self.events = []
 
     async def start(self) -> None:
@@ -248,6 +257,11 @@ class DrillEngine:
         while True:
             packet = await link.queue.get()
             async with self._lock:
+                if packet.status in {"delivered", "acked"}:
+                    # A packet that was already handed to the peer must never be
+                    # delivered a second time, even if it accidentally re-enters
+                    # a queue.
+                    continue
                 link.current_packet_id = packet.id
                 link.current_phase = "delivering"
                 packet.status = "delivering"
@@ -313,6 +327,9 @@ class DrillEngine:
             raise DrillError(400, f"link must be one of {LINK_IDS}")
         async with self._lock:
             active = self._active_removal()
+            if active is not None:
+                self._expire_if_due(active)
+                active = self._active_removal()
             if self.links[link].removed:
                 raise DrillError(
                     409,
@@ -355,12 +372,19 @@ class DrillEngine:
                 )
 
             active = self._active_removal()
+            if active is not None:
+                # The wait deadline is authoritative: even if the timeout
+                # callback has not run yet, a send after the deadline must
+                # observe a timed-out removal and release the buffer first.
+                self._expire_if_due(active)
+                active = self._active_removal()
             buffering = (
                 active is not None
                 and active.status == "pending"
                 and flow_id in active.affected_flow_ids
             )
 
+            self._accept_counter += 1
             packet = Packet(
                 id=f"pkt-{uuid.uuid4().hex[:12]}",
                 flow_id=flow_id,
@@ -368,6 +392,7 @@ class DrillEngine:
                 payload=payload,
                 accepted_at=utcnow(),
                 accept_index=flow.accepted_count + 1,
+                accept_order=self._accept_counter,
             )
 
             if buffering:
@@ -476,6 +501,9 @@ class DrillEngine:
 
         async with self._lock:
             active = self._active_removal()
+            if active is not None:
+                self._expire_if_due(active)
+                active = self._active_removal()
             if active is not None and active.status == "pending":
                 raise DrillError(
                     409,
@@ -496,13 +524,19 @@ class DrillEngine:
                     {"target_link": target_link},
                 )
 
+            # The wait starts when the service accepts the request, measured
+            # with the monotonic clock so wall-clock changes cannot skew it.
+            created_monotonic = time.monotonic()
+            created_wall = datetime.now(timezone.utc)
             removal = RemovalRequest(
                 id=f"rm-{uuid.uuid4().hex[:10]}",
                 member_link=member_link,
                 target_link=target_link,
                 wait_ms=wait_ms,
                 buffer_limit=buffer_limit,
-                created_at=utcnow(),
+                created_at=iso_utc(created_wall),
+                deadline_at=iso_utc(created_wall + timedelta(milliseconds=wait_ms)),
+                deadline_monotonic=created_monotonic + wait_ms / 1000,
             )
             affected = [f for f in self.flows.values() if f.link == member_link]
             removal.affected_flow_ids = [f.id for f in affected]
@@ -515,7 +549,7 @@ class DrillEngine:
                 and p.status in {"queued", "delivering", "delivered"}
                 and p.buffered_for_removal is None
             ]
-            snapshot.sort(key=lambda p: (p.flow_id, p.accept_index))
+            snapshot.sort(key=lambda p: p.accept_order)
             removal.snapshot_packet_ids = [p.id for p in snapshot]
             removal.snapshot_acked = 0
             self.removals[removal.id] = removal
@@ -527,6 +561,7 @@ class DrillEngine:
                 target_link=target_link,
                 wait_ms=wait_ms,
                 buffer_limit=buffer_limit,
+                deadline_at=removal.deadline_at,
                 affected_flow_ids=list(removal.affected_flow_ids),
                 snapshot_packet_ids=list(removal.snapshot_packet_ids),
             )
@@ -537,11 +572,16 @@ class DrillEngine:
                 snapshot_count=len(snapshot),
             )
 
+            # Only confirmations that arrived before the deadline count. If the
+            # request was created with everything already confirmed, it succeeds
+            # immediately; otherwise a timer wakes up exactly at the deadline.
             if all(self._packet_acked(pid) for pid in removal.snapshot_packet_ids):
                 self._finish_removal(removal, "succeeded", "peer_confirmed")
             else:
+                delay = max(0.0, removal.deadline_monotonic - time.monotonic())
                 removal.timeout_task = asyncio.create_task(
-                    self._removal_timeout(removal.id), name=f"timeout-{removal.id}"
+                    self._removal_timeout(removal.id, delay),
+                    name=f"timeout-{removal.id}",
                 )
             return removal.to_dict()
 
@@ -549,11 +589,40 @@ class DrillEngine:
         packet = self._packets.get(packet_id)
         return packet is not None and packet.status == "acked"
 
+    def _expire_if_due(self, removal: RemovalRequest) -> bool:
+        """Finish a pending removal as timed out once its deadline has passed.
+
+        Must be called while holding the lock. The deadline (not the timer) is
+        the source of truth, so confirmations and sends that race with a late
+        timer callback still see the correct result. Returns True if this call
+        finalized the removal.
+        """
+        if removal.status != "pending":
+            return False
+        if time.monotonic() < removal.deadline_monotonic:
+            return False
+        self._finish_removal(removal, "timed_out", "wait_timeout")
+        return True
+
     def _on_packet_acked(self, packet: Packet) -> None:
+        """Record a peer confirmation. Must be called while holding the lock."""
         for removal in self.removals.values():
             if packet.id not in removal.snapshot_packet_ids:
                 continue
             if removal.status == "pending":
+                if time.monotonic() >= removal.deadline_monotonic:
+                    # The deadline already passed; the completion arrived too
+                    # late even though the timer callback may not have run yet.
+                    self._finish_removal(removal, "timed_out", "wait_timeout")
+                    removal.late_confirmations_ignored += 1
+                    removal.late_confirmation_packet_ids.append(packet.id)
+                    removal.add_event(
+                        "late_confirmation_ignored",
+                        packet_id=packet.id,
+                        flow_id=packet.flow_id,
+                        seq=packet.seq,
+                    )
+                    continue
                 removal.snapshot_acked += 1
                 if all(self._packet_acked(pid) for pid in removal.snapshot_packet_ids):
                     self._finish_removal(removal, "succeeded", "peer_confirmed")
@@ -567,9 +636,15 @@ class DrillEngine:
                     seq=packet.seq,
                 )
 
-    async def _removal_timeout(self, removal_id: str) -> None:
+    async def _removal_timeout(self, removal_id: str, delay: float) -> None:
         removal = self.removals[removal_id]
-        await asyncio.sleep(removal.wait_ms / 1000)
+        delay = max(0.0, delay)
+        while True:
+            if delay <= 0:
+                break
+            await asyncio.sleep(delay)
+            # Guard against waking a hair early: the deadline is authoritative.
+            delay = removal.deadline_monotonic - time.monotonic()
         async with self._lock:
             if removal.status != "pending":
                 return
@@ -614,7 +689,7 @@ class DrillEngine:
             if packet is None or packet.status != "buffered":
                 continue
             flushed.append(packet)
-        flushed.sort(key=lambda p: (p.flow_id, p.accept_index))
+        flushed.sort(key=lambda p: p.accept_order)
         for packet in flushed:
             packet.buffered_for_removal = None
             self._enqueue(packet, flush_link)
@@ -646,6 +721,9 @@ class DrillEngine:
     async def state(self) -> dict:
         async with self._lock:
             active = self._active_removal()
+            if active is not None:
+                self._expire_if_due(active)
+                active = self._active_removal()
             return {
                 "links": [self.links[lid].to_dict() for lid in LINK_IDS],
                 "flows": [flow.to_dict() for flow in self.flows.values()],
@@ -656,6 +734,8 @@ class DrillEngine:
 
     async def list_removals(self) -> list[dict]:
         async with self._lock:
+            for removal in self.removals.values():
+                self._expire_if_due(removal)
             return [
                 self.removals[rid].to_summary()
                 for rid in reversed(self._removal_order)
@@ -666,6 +746,7 @@ class DrillEngine:
             removal = self.removals.get(removal_id)
             if removal is None:
                 raise DrillError(404, f"unknown removal {removal_id!r}")
+            self._expire_if_due(removal)
             return removal.to_dict()
 
     async def reset(self) -> dict:

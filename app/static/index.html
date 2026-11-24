@@ -366,6 +366,7 @@ function renderActiveRemoval(removal) {
     ["状态", statusPill],
     ["成员 → 目标", `${removal.member_link} → ${removal.target_link}`],
     ["等待时限", `${removal.wait_ms} ms`],
+    ["截止点", removal.deadline_at || "-"],
     ["缓冲上限", `${removal.buffer_limit} 包`],
     ["待确认报文", `${removal.snapshot_acked} / ${removal.snapshot_packet_count}`],
     ["当前缓冲", `${removal.buffer_used} 包`],

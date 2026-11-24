@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import EngineConfig, LinkConfig
+from app.engine import DrillEngine
 from app.main import create_app
 
 
@@ -321,3 +324,169 @@ def test_static_ui_is_served(client):
     assert response.status_code == 200
     assert "聚合口摘链演练" in response.text
     assert "https://" not in response.text  # no external assets needed offline
+
+
+# --------------------------------------------------------------------------
+# Deadline-driven timeout semantics
+# --------------------------------------------------------------------------
+
+
+def test_deadline_is_measured_from_request_acceptance(client):
+    """The wait clock starts when the request is accepted; time already spent
+    on the link and sends made during the wait do not extend the deadline."""
+    client.patch("/api/links/A", json={"delivery_delay_ms": 2000, "ack_delay_ms": 0})
+    create_flow(client, "f", "A")
+    send(client, "f", 1)  # will not be acked for ~2s
+    body = client.post(
+        "/api/removals", json={"member_link": "A", "wait_ms": 500, "buffer_limit": 4}
+    ).json()
+    assert body["status"] == "pending"
+    assert body["created_at"] is not None and body["deadline_at"] is not None
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    # deadline = acceptance time + wait_ms
+    delta = parse(body["deadline_at"]) - parse(body["created_at"])
+    assert 0.49 <= delta.total_seconds() <= 0.52
+
+    # Sends during the wait do not push the deadline out.
+    time.sleep(0.2)
+    send(client, "f", 2, expect=202)
+    detail = removal(client, body["removal_id"])
+    assert detail["deadline_at"] == body["deadline_at"]
+    assert detail["status"] in {"pending", "succeeded"}
+
+
+def test_confirmation_at_deadline_is_late_even_before_timeout_callback():
+    """A confirmation processed after the deadline must lose even when the
+    timer callback never ran (simulated by cancelling it)."""
+
+    async def run() -> None:
+        engine = DrillEngine(link_a_delivery_ms=60, link_a_ack_ms=10,
+                             link_b_delivery_ms=0, link_b_ack_ms=0)
+        await engine.start()
+        try:
+            await engine.create_flow("f", "A")
+            await engine.send_packet("f", 1)
+            removal = await engine.create_removal("A", wait_ms=20, buffer_limit=4)
+            assert removal["status"] == "pending"
+            rm = engine.removals[removal["removal_id"]]
+            assert rm.timeout_task is not None
+            # Starve the timeout callback: the ack (at ~70ms) will arrive well
+            # after the 20ms deadline with no timer left to finalize it.
+            rm.timeout_task.cancel()
+            rm.timeout_task = None
+            await asyncio.sleep(0.15)
+
+            result = await engine.get_removal(removal["removal_id"])
+            assert result["status"] == "timed_out", result
+            assert result["late_confirmations_ignored"] == 1
+            assert len(result["late_confirmation_packet_ids"]) == 1
+            assert result["moved_flow_ids"] == []
+            assert engine.flows["f"].link == "A"
+
+            # A send after the deadline returns 201 immediately and never 429s,
+            # even though the buffer was never released by the callback.
+            sent = await engine.send_packet("f", 2)
+            assert sent["buffered"] is False
+            assert sent["packet"]["status"] == "queued"
+            assert sent["packet"]["link"] == "A"
+
+            # Each packet delivered exactly once, in acceptance order.
+            await asyncio.sleep(0.3)
+            delivery = engine.flows["f"].received
+            assert [x["seq"] for x in delivery] == [1, 2]
+            assert len({x["packet_id"] for x in delivery}) == 2
+        finally:
+            await engine.stop()
+
+    asyncio.run(run())
+
+
+def test_send_after_deadline_flushes_buffer_in_acceptance_order_and_returns_201(client):
+    """After the deadline, a new packet first flushes the buffer back to the
+    original link in acceptance order, then joins the queue (201, not 429)."""
+    create_flow(client, "f", "A")
+    send(client, "f", 1)  # ~90ms on A
+    body = client.post(
+        "/api/removals", json={"member_link": "A", "wait_ms": 30, "buffer_limit": 2}
+    ).json()
+    removal_id = body["removal_id"]
+    send(client, "f", 2, expect=202)
+    send(client, "f", 3, expect=202)
+    # Buffer is full: another send during the wait is rejected with 429.
+    assert client.post("/api/flows/f/packets", json={"seq": 4}).status_code == 429
+
+    time.sleep(0.05)  # deadline (30ms) has passed
+    sent = send(client, "f", 4)  # not 429, not 202: accepted into the link queue
+    assert sent["buffered"] is False
+    assert sent["removal_id"] is None
+    assert sent["packet"]["link"] == "A"
+
+    detail = removal(client, removal_id)
+    assert detail["status"] == "timed_out"
+    assert detail["flushed_to"] == "A"
+    assert detail["moved_flow_ids"] == []
+    # Buffered packets are flushed before the new packet joins the queue.
+    flushed_seqs = [client.get(f"/api/packets/{pid}").json()["seq"]
+                    for pid in detail["flushed_packet_ids"]]
+    assert flushed_seqs == [2, 3]
+
+    assert wait_for(client, lambda: len(received(client, "f")) == 4)
+    order = received(client, "f")
+    assert [item["seq"] for item in order] == [1, 2, 3, 4]
+    assert [item["link"] for item in order] == ["A", "A", "A", "A"]
+    # Every accepted packet is delivered exactly once.
+    assert len({item["packet_id"] for item in order}) == 4
+
+
+def test_late_confirmation_is_only_recorded_in_removal():
+    """Confirmations after the timeout never change the outcome, they only
+    show up in the removal's late-confirmation bookkeeping."""
+
+    async def run() -> None:
+        engine = DrillEngine(link_a_delivery_ms=20, link_a_ack_ms=20,
+                             link_b_delivery_ms=0, link_b_ack_ms=0)
+        await engine.start()
+        try:
+            await engine.create_flow("f", "A")
+            await engine.create_flow("g", "B")
+            await engine.send_packet("f", 1)
+            rm = await engine.create_removal("A", wait_ms=10, buffer_limit=2)
+            await asyncio.sleep(0.05)  # timeout fires (~40ms of work on A)
+            assert engine.removals[rm["removal_id"]].status == "timed_out"
+            await asyncio.sleep(0.1)  # ack for f#1 now arrives
+            detail = await engine.get_removal(rm["removal_id"])
+            assert detail["status"] == "timed_out"
+            assert detail["snapshot_acked"] == 0
+            assert detail["late_confirmations_ignored"] == 1
+            assert len(detail["late_confirmation_packet_ids"]) == 1
+            assert detail["moved_flow_ids"] == []
+            assert engine.flows["f"].link == "A"
+            # The packet is delivered exactly once, on the member link.
+            delivery = engine.flows["f"].received
+            assert [x["seq"] for x in delivery] == [1]
+            assert delivery[0]["link"] == "A"
+        finally:
+            await engine.stop()
+
+    asyncio.run(run())
+
+
+def test_buffered_packets_survive_only_once_through_flush(client):
+    """Flushing the buffer must not duplicate packets that were already
+    enqueued when the removal finished."""
+    create_flow(client, "f", "A")
+    send(client, "f", 1)
+    body = client.post(
+        "/api/removals", json={"member_link": "A", "wait_ms": 5000, "buffer_limit": 5}
+    ).json()
+    send(client, "f", 2, expect=202)
+    assert wait_for(client, lambda: removal(client, body["removal_id"])["status"] == "succeeded")
+    send(client, "f", 3, expect=201)
+    assert wait_for(client, lambda: len(received(client, "f")) == 3)
+    order = received(client, "f")
+    assert [item["seq"] for item in order] == [1, 2, 3]
+    assert len({item["packet_id"] for item in order}) == 3
+

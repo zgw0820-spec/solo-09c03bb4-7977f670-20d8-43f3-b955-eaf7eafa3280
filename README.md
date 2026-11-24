@@ -10,10 +10,16 @@
   然后才取下一个。因此同一条流按接纳顺序送达，不丢不重。
 - **对端确认**：摘链申请创建时，把成员链路上**当时已排队/在途**的受影响流报文
   记为一个快照。对端把快照中每个报文都收齐并回确认后，才把受影响流切到另一条链路。
+- **等待时限从服务受理申请时起算**（单调时钟），截止点 `deadline_at` 写在申请里。
+  截止前收齐快照确认才切链；**到期未收齐即判超时**。所有判断（确认、发包、查询）
+  都以这个截止点为准，不依赖超时回调是否已经运行。
 - **等待期间**：待迁流的新包进入缓冲；缓冲总数达到上限就返回 `429` 拒收，**其他流
   照常发送**。被拒的编号没有被接纳，摘链结束后可以重发。
-- **超时**：到达等待时限仍未收齐确认，本次摘链失败（`timed_out`），流不迁移，
-  缓冲的报文按接纳顺序回到**原链路**。之后才到的确认会被记录，但**不会改变**本次结果。
+- **超时**：流不迁移，缓冲的报文按**全局接纳顺序**排回**原链路**。截止后收到的确认
+  只在摘链记录里记为**迟到**（`late_confirmations_ignored`），不改变结果。
+- **到期后发包**：截止点一过，即使超时回调还没运行，给待迁流发新包也会先按接纳
+  顺序把缓冲包排回原链路，新包接着入队并返回 `201`（而不是 `429`）。
+- **每包只送达一次**：已送达/已确认的报文不会因为缓冲回排或状态切换被再次投递。
 - **一次只处理一个摘链申请**：已有 pending 申请时，第二个申请返回 `409`。
 - 摘链成功后，成员链路从聚合组中摘除（`removed: true`），不能再在它上面建流；
   此时两条链路只剩一条，无法再摘，直到 `POST /api/reset` 复原。
@@ -100,6 +106,26 @@ curl -s $BASE/api/flows/voice/received | python3 -m json.tool
 结果会是 `timed_out`、`moved_flow_ids: []`、`flushed_to: "A"`，之后迟到的确认
 只体现在 `late_confirmations_ignored`。
 
+到期后发包场景：`wait_ms` 设小、链路 A 延时设大，截止点过后（确认仍未到）再发包：
+
+```bash
+curl -s -X PATCH $BASE/api/links/A \
+  -H 'Content-Type: application/json' -d '{"delivery_delay_ms":600,"ack_delay_ms":400}'
+curl -s -X POST $BASE/api/flows -H 'Content-Type: application/json' -d '{"flow_id":"edge","link":"A"}'
+curl -s -X POST $BASE/api/flows/edge/packets -H 'Content-Type: application/json' -d '{"seq":1}'
+RM=$(curl -s -X POST $BASE/api/removals -H 'Content-Type: application/json' \
+  -d '{"member_link":"A","wait_ms":150,"buffer_limit":2}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["removal_id"])')
+curl -s -X POST $BASE/api/flows/edge/packets -H 'Content-Type: application/json' -d '{"seq":2}'  # 202
+curl -s -X POST $BASE/api/flows/edge/packets -H 'Content-Type: application/json' -d '{"seq":3}'  # 202
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/api/flows/edge/packets \
+  -H 'Content-Type: application/json' -d '{"seq":4}'                                              # 429 缓冲满
+sleep 0.3
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $BASE/api/flows/edge/packets \
+  -H 'Content-Type: application/json' -d '{"seq":4}'                                              # 201 到期后
+curl -s $BASE/api/removals/$RM | python3 -m json.tool      # timed_out, flushed_to=A
+```
+
 缓冲上限场景：把 `buffer_limit` 设成 `1`，等待期间发两包，第二包返回 `429`。
 被拒的 seq 未接纳，摘链完成后可以重发。
 
@@ -110,10 +136,11 @@ curl -s $BASE/api/flows/voice/received | python3 -m json.tool
 python3 drills/run_drill.py --base-url http://localhost:8000
 # 或让 Compose 起一个一次性客户端（跑完即退出）
 docker compose --profile drill run --rm drill-client
-# 只跑某个场景：--only success|timeout|buffer|after_removal
+# 只跑某个场景：--only success|timeout|buffer|deadline|after_removal
 ```
 
-脚本只依赖标准库，四个场景全部通过时返回 0，否则返回 1 并列出失败项。
+脚本只依赖标准库，五个场景（含到期后发包的 `deadline`）全部通过时返回 0，
+否则返回 1 并列出失败项。
 
 ## 接口一览
 
@@ -129,7 +156,7 @@ docker compose --profile drill run --rm drill-client
 | GET | `/api/packets/{packet_id}` | 单个报文的状态与走过的链路 |
 | POST | `/api/removals` | 申请摘链 `{member_link, wait_ms, buffer_limit}`；需等待 202，立即完成 200 |
 | GET | `/api/removals` | 所有申请（倒序摘要） |
-| GET | `/api/removals/{id}` | 单个申请详情：快照、确认进度、缓冲、拒收、迟到确认、事件时间线 |
+| GET | `/api/removals/{id}` | 单个申请详情：快照、确认进度、缓冲、拒收、迟到确认、截止点、事件时间线 |
 | GET | `/api/state` | 链路 + 流 + 当前申请 + 最近事件 |
 | POST | `/api/reset` | 清空并重建两条链路 |
 
@@ -160,5 +187,5 @@ python3 -m pytest -q
 - 状态全部在内存，重启容器即清空；只适合演练，不作持久化。
 - 每个成员链路用一条 `asyncio` 任务串行处理，模拟 FIFO；没有真实网络丢包/乱序。
 - “对端确认”由服务内部模拟：快照报文全部被确认即视为对端收齐；没有独立的对端进程。
-- 超时判定是精确的一次性定时器，需等待时长与链路延时同量级时，边界上偶发的
-  先后顺序属于正常现象。
+- 超时判定以受理时记录的单调时钟截止点为准；超时回调只负责在截止点唤醒，即使它
+  延迟运行，确认和发包也会按截止点得到相同的结论（迟到的确认只记入摘链记录）。
